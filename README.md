@@ -22,7 +22,6 @@ CODEARTS_AK=你的AccessKey
 CODEARTS_SK=你的SecretKey
 ```
 
-> ⚠️ 当前 `.env` 中的密钥已在公开对话中出现过，**请立即到华为云 IAM 控制台删除并重新创建**，然后替换到 `.env`。
 
 ### 3. 启动代理
 
