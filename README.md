@@ -21,7 +21,10 @@ pip install -r requirements.txt
 CODEARTS_AK=你的AccessKey
 CODEARTS_SK=你的SecretKey
 ```
+#### 如何获取AK/SK(Access Key/Secret Key)
+进入 https://console.huaweicloud.com/iam/#/mine/accessKey ，登录后-->新增访问密钥 即可获取
 
+**请勿泄露你的AK/SK，这具有华为云账号的最高访问权限**
 
 ### 3. 启动代理
 
@@ -65,7 +68,7 @@ python test_openai.py
 
 ```text
 codearts-openai-proxy/
-├── .env               # AK/SK（勿提交到公开仓库）
+├── .env               # AK/SK
 ├── server.py          # 主服务：签名 + 转发
 ├── requirements.txt   # Python 依赖
 ├── test_openai.py     # 本地测试脚本
@@ -77,3 +80,4 @@ codearts-openai-proxy/
 - 代理只做签名和转发，不修改模型行为。
 - 每次调用会消耗华为云 CodeArts 套餐额度（token）。
 - 仅绑定 `127.0.0.1`，不会对外网开放。
+- 本项目与华为云平台及其附属公司无任何关系，且华为云平台中并未对本项目中调用方式明确提出允许，若造成封号/限制等情况与项目作者无关
