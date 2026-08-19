@@ -9,7 +9,6 @@
 ### 1. 安装依赖
 
 ```cmd
-cd /d C:\Users\johnsheng\Desktop\codearts-openai-proxy
 pip install -r requirements.txt
 ```
 
