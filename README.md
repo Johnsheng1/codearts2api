@@ -1,6 +1,6 @@
 # CodeArts OpenAI 兼容代理
 
-把华为云 CodeArts 的模型接口（盘古开源大模型2.0、GLM-5.2）包装成**标准 OpenAI Chat Completions API**。
+把华为云 CodeArts [https://codearts.huaweicloud.com/] 的模型接口（盘古开源大模型2.0、GLM-5.2）包装成**标准 OpenAI Chat Completions API**。
 
 底层走华为云 `SDK-HMAC-SHA256` 请求签名，AK/SK 存放在 `.env`。
 
