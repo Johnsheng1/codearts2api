@@ -67,7 +67,7 @@ python test_openai.py
 ## 代码结构
 
 ```text
-codearts-openai-proxy/
+codearts2api/
 ├── .env               # AK/SK
 ├── server.py          # 主服务：签名 + 转发
 ├── requirements.txt   # Python 依赖
