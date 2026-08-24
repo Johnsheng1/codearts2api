@@ -1,0 +1,60 @@
+{
+  "updated_at": 1787548970,
+  "models": [
+    {
+      "id": "GLM-5.2",
+      "object": "model",
+      "owned_by": "codearts",
+      "name": "GLM-5.2",
+      "description": "",
+      "context_window": 202752,
+      "max_tokens": 131072,
+      "supports_images": false,
+      "enable_queue": true
+    },
+    {
+      "id": "openpangu-2.0-flash",
+      "object": "model",
+      "owned_by": "codearts",
+      "name": "openpangu-2.0-flash",
+      "description": "",
+      "context_window": 524288,
+      "max_tokens": 131072,
+      "supports_images": false,
+      "enable_queue": true
+    },
+    {
+      "id": "GLM-4.7-SFT-Harmony",
+      "object": "model",
+      "owned_by": "codearts",
+      "name": "GLM-4.7-SFT-Harmony",
+      "description": "",
+      "context_window": 202752,
+      "max_tokens": 65536,
+      "supports_images": false,
+      "enable_queue": true
+    },
+    {
+      "id": "openpangu-2.0-pro",
+      "object": "model",
+      "owned_by": "codearts",
+      "name": "openpangu-2.0-pro",
+      "description": "",
+      "context_window": 524288,
+      "max_tokens": 131072,
+      "supports_images": false,
+      "enable_queue": true
+    },
+    {
+      "id": "Qwen3-VL-235B",
+      "object": "model",
+      "owned_by": "codearts",
+      "name": "Qwen3-VL-235B",
+      "description": "",
+      "context_window": 1048576,
+      "max_tokens": 131072,
+      "supports_images": true,
+      "enable_queue": true
+    }
+  ]
+}

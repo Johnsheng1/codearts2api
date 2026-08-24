@@ -18,6 +18,8 @@ import hashlib
 import hmac
 import json
 import os
+import time
+import urllib.parse
 
 import requests
 from dotenv import load_dotenv
@@ -31,11 +33,68 @@ if not AK or not SK:
     raise SystemExit("缺少 CODEARTS_AK / CODEARTS_SK，请在 .env 中配置后重试")
 
 # CodeArts 目标端点（从抓包确认）
-TARGET = "https://snap-access.cn-north-4.myhuaweicloud.com/api/v2/chat/completions"
+BASE_URL = "https://snap-access.cn-north-4.myhuaweicloud.com"
+TARGET = BASE_URL + "/api/v2/chat/completions"
 HOST = "snap-access.cn-north-4.myhuaweicloud.com"
-SUPPORTED_MODELS = ["openpangu-2.0-pro", "openpangu-2.0-flash", "GLM-5.2"]
+AGENT_LIST_URL = BASE_URL + "/v1/agent-center/agents/useragents?offset=0&limit=100"
+AGENT_DETAIL_PATH = "/v1/agent-center/agents/detail"
+
+# 自动同步失败时的兜底列表；正常启动会用云端返回的列表覆盖它
+FALLBACK_MODELS = ["openpangu-2.0-pro", "openpangu-2.0-flash", "GLM-5.2"]
+# 模型缓存与代理程序放在同一目录，便于迁移、备份和排查
+MODEL_CACHE_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "models-cache.json"
+)
+SUPPORTED_MODELS = list(FALLBACK_MODELS)
+MODEL_DETAILS = {}
 
 app = Flask(__name__)
+
+
+def _signed_request(method: str, url: str, body: bytes = b"", extra_headers=None, timeout=30):
+    """发送带华为云 SDK-HMAC-SHA256 签名的请求。"""
+    parsed = urllib.parse.urlparse(url)
+    path = parsed.path or "/"
+    canonical_uri = path if path.endswith("/") else path + "/"
+    params = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+    params.sort(key=lambda item: (item[0], item[1]))
+    quote = lambda value: urllib.parse.quote(str(value), safe="-_.~")
+    canonical_query = "&".join(
+        f"{quote(key)}={quote(value)}" for key, value in params
+    )
+
+    headers = {}
+    for key, value in (extra_headers or {}).items():
+        headers[key.lower()] = str(value)
+    headers["host"] = parsed.netloc
+    headers.setdefault("content-type", "application/json")
+    sdk_date = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    headers["x-sdk-date"] = sdk_date
+
+    signed_names = sorted(headers)
+    canonical_headers = "".join(
+        f"{name}:{headers[name].strip()}\n" for name in signed_names
+    )
+    signed_headers = ";".join(signed_names)
+    payload_hash = hashlib.sha256(body).hexdigest()
+    canonical_request = (
+        f"{method.upper()}\n{canonical_uri}\n{canonical_query}\n"
+        f"{canonical_headers}\n{signed_headers}\n{payload_hash}"
+    )
+    string_to_sign = (
+        f"SDK-HMAC-SHA256\n{sdk_date}\n"
+        f"{hashlib.sha256(canonical_request.encode()).hexdigest()}"
+    )
+    signature = hmac.new(
+        SK.encode(), string_to_sign.encode(), hashlib.sha256
+    ).hexdigest()
+    headers["authorization"] = (
+        f"SDK-HMAC-SHA256 Access={AK}, SignedHeaders={signed_headers}, "
+        f"Signature={signature}"
+    )
+    return requests.request(
+        method.upper(), url, data=body or None, headers=headers, timeout=timeout
+    )
 
 
 def _hmac_headers(body: bytes) -> dict:
@@ -75,6 +134,134 @@ def _hmac_headers(body: bytes) -> dict:
     return headers
 
 
+def _load_model_cache() -> bool:
+    """加载本地模型缓存，返回是否成功。"""
+    global SUPPORTED_MODELS, MODEL_DETAILS
+    try:
+        with open(MODEL_CACHE_PATH, "r", encoding="utf-8") as file:
+            cached = json.load(file)
+        models = cached.get("models", [])
+        if not models:
+            return False
+        SUPPORTED_MODELS = [item["id"] for item in models if item.get("id")]
+        MODEL_DETAILS = {item["id"]: item for item in models if item.get("id")}
+        return bool(SUPPORTED_MODELS)
+    except (OSError, ValueError, TypeError, KeyError):
+        return False
+
+
+def _save_model_cache(models) -> None:
+    os.makedirs(os.path.dirname(MODEL_CACHE_PATH), exist_ok=True)
+    payload = {
+        "updated_at": int(time.time()),
+        "models": models,
+    }
+    temp_path = MODEL_CACHE_PATH + ".tmp"
+    with open(temp_path, "w", encoding="utf-8") as file:
+        json.dump(payload, file, ensure_ascii=False, indent=2)
+    os.replace(temp_path, MODEL_CACHE_PATH)
+
+
+def _refresh_models() -> bool:
+    """从 CodeArts AgentCenter 获取当前账号可用模型。"""
+    global SUPPORTED_MODELS, MODEL_DETAILS
+    try:
+        # 与 CodeArts CLI 抓包一致：AgentCenter 接口需要这个路由头。
+        response = _signed_request(
+            "GET",
+            AGENT_LIST_URL,
+            extra_headers={
+                "agent-type": "AgentCenter",
+                "x-language": "zh-cn",
+                "accept": "application/json",
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+        data = response.json()
+        agents = data.get("agents", [])
+        if not agents:
+            return False
+
+        # 优先主 Agent；若某个详情无模型，再尝试其他主 Agent。
+        candidates = sorted(
+            agents,
+            key=lambda item: (
+                not bool(item.get("is_primary_agent")),
+                item.get("agent_order") is None,
+                item.get("agent_order") or 999999,
+            ),
+        )
+        discovered = []
+        for agent in candidates:
+            agent_id = agent.get("agent_id")
+            if not agent_id:
+                continue
+            detail_url = (
+                f"{BASE_URL}{AGENT_DETAIL_PATH}?agent_id="
+                f"{urllib.parse.quote(str(agent_id), safe='')}"
+            )
+            detail_response = _signed_request(
+                "GET",
+                detail_url,
+                extra_headers={
+                    "agent-type": "AgentCenter",
+                    "x-language": "zh-cn",
+                    "accept": "application/json",
+                },
+                timeout=30,
+            )
+            if detail_response.status_code != 200:
+                continue
+            detail = detail_response.json()
+            for model in (detail.get("gpts", {}).get("models", []) or []):
+                model_id = model.get("model_id") or model.get("model_alias")
+                if not model_id or any(item["id"] == model_id for item in discovered):
+                    continue
+                params = model.get("model_parameters") or {}
+                discovered.append(
+                    {
+                        "id": model_id,
+                        "object": "model",
+                        "owned_by": "codearts",
+                        "name": model.get("model_alias") or model.get("model_name") or model_id,
+                        "description": model.get("model_desc") or "",
+                        "context_window": params.get("context_window"),
+                        "max_tokens": params.get("max_tokens"),
+                        "supports_images": params.get("supports_images", False),
+                        "enable_queue": params.get("enable_queue", False),
+                    }
+                )
+            if discovered:
+                # 主 Agent 已拿到完整模型列表，避免不必要请求。
+                break
+
+        if not discovered:
+            return False
+        SUPPORTED_MODELS = [item["id"] for item in discovered]
+        MODEL_DETAILS = {item["id"]: item for item in discovered}
+        _save_model_cache(discovered)
+        print("已自动同步模型:", ", ".join(SUPPORTED_MODELS))
+        return True
+    except (requests.RequestException, ValueError, TypeError, KeyError, OSError) as error:
+        print("自动同步模型失败，将使用缓存或兜底列表:", error)
+        return False
+
+
+def _refresh_models_if_needed() -> None:
+    """模型列表短时缓存，避免 Cherry Studio 频繁轮询时重复请求。"""
+    # 进程刚启动时先把缓存详情装载到内存；不能只依赖兜底模型名。
+    if not MODEL_DETAILS:
+        _load_model_cache()
+    try:
+        age = time.time() - os.path.getmtime(MODEL_CACHE_PATH)
+    except OSError:
+        age = float("inf")
+    if age > 300:
+        if not _refresh_models():
+            _load_model_cache()
+
+
 def _cors(resp: Response) -> Response:
     resp.headers["Access-Control-Allow-Origin"] = "*"
     resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
@@ -87,18 +274,71 @@ def after_request(resp: Response) -> Response:
     return _cors(resp)
 
 
+def _model_payload(model_id: str) -> dict:
+    """生成 OpenAI 模型对象，并附带常见能力元数据。"""
+    detail = MODEL_DETAILS.get(model_id, {})
+    context_window = detail.get("context_window")
+    max_tokens = detail.get("max_tokens")
+    supports_images = bool(detail.get("supports_images", False))
+    payload = {
+        "id": model_id,
+        "object": "model",
+        "created": 0,
+        "owned_by": "codearts",
+        "name": detail.get("name") or model_id,
+        "description": detail.get("description") or "",
+        # 常见 OpenAI 兼容客户端会读取其中一部分；未知字段会被安全忽略。
+        "context_window": context_window,
+        "context_length": context_window,
+        "max_tokens": max_tokens,
+        "max_output_tokens": max_tokens,
+        "supports_images": supports_images,
+        "vision": supports_images,
+        "supports_vision": supports_images,
+        "supports_function_calling": True,
+        "supports_tool_calling": True,
+        "supports_reasoning": True,
+        "input_modalities": ["text", "image"] if supports_images else ["text"],
+        "output_modalities": ["text"],
+        "supported_parameters": [
+            "temperature",
+            "top_p",
+            "max_tokens",
+            "stream",
+            "tools",
+            "tool_choice",
+            "response_format",
+        ],
+    }
+    return {key: value for key, value in payload.items() if value is not None}
+
+
 @app.route("/v1/models", methods=["GET", "OPTIONS"])
 def list_models():
     if request.method == "OPTIONS":
         return _cors(Response(""))
-    data = {
+    _refresh_models_if_needed()
+    return jsonify({
         "object": "list",
-        "data": [
-            {"id": m, "object": "model", "created": 0, "owned_by": "codearts"}
-            for m in SUPPORTED_MODELS
-        ],
-    }
-    return jsonify(data)
+        "data": [_model_payload(model_id) for model_id in SUPPORTED_MODELS],
+    })
+
+
+@app.route("/v1/models/<path:model_id>", methods=["GET", "OPTIONS"])
+def get_model(model_id):
+    """提供标准 OpenAI 单模型详情接口，方便客户端二次读取能力。"""
+    if request.method == "OPTIONS":
+        return _cors(Response(""))
+    _refresh_models_if_needed()
+    if model_id not in SUPPORTED_MODELS:
+        return _cors(jsonify({
+            "error": {
+                "message": f"model '{model_id}' not found",
+                "type": "invalid_request_error",
+                "code": "model_not_found",
+            }
+        })), 404
+    return jsonify(_model_payload(model_id))
 
 
 @app.route("/v1/chat/completions", methods=["POST", "OPTIONS"])
@@ -114,10 +354,25 @@ def chat_completions():
     except Exception:
         return _cors(jsonify({"error": {"message": "invalid JSON body"}})), 400
 
-    # 模型名归一化
+    # 模型名归一化；请求聊天时也按短缓存周期同步一次模型列表
+    _refresh_models_if_needed()
     model = req_json.get("model", SUPPORTED_MODELS[0])
     if model not in SUPPORTED_MODELS:
-        model = SUPPORTED_MODELS[0]
+        return (
+            _cors(
+                jsonify(
+                    {
+                        "error": {
+                            "message": f"model '{model}' 不在当前账号可用模型列表中",
+                            "type": "invalid_request_error",
+                            "param": "model",
+                            "code": "model_not_found",
+                        }
+                    }
+                )
+            ),
+            404,
+        )
     req_json["model"] = model
 
     # 客户端是否要流式
