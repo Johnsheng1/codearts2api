@@ -262,6 +262,111 @@ def _refresh_models_if_needed() -> None:
             _load_model_cache()
 
 
+def _normalize_finish_reason(value):
+    """把 CodeArts 的结束原因转换为 OpenAI 客户端能识别的值。"""
+    if value in (None, "other"):
+        return "stop"
+    return value
+
+
+def _parse_sse_bytes(raw: bytes):
+    """把上游 SSE 聚合为一个 OpenAI chat.completion JSON。"""
+    text_parts = []
+    reasoning_parts = []
+    tool_calls = {}
+    result = {
+        "id": None,
+        "object": "chat.completion",
+        "created": None,
+        "model": None,
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": ""},
+            "finish_reason": "stop",
+        }],
+    }
+    usage = None
+    last_finish_reason = None
+
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or not line.startswith(b"data:"):
+            continue
+        payload = line[5:].lstrip()
+        if payload == b"[DONE]":
+            continue
+        try:
+            chunk = json.loads(payload.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+
+        # CodeArts 可能以 HTTP 200 返回业务错误，需要保留错误信息。
+        if chunk.get("error_code") or chunk.get("error_msg"):
+            return {
+                "error": {
+                    "message": chunk.get("error_msg") or "CodeArts upstream error",
+                    "type": "upstream_error",
+                    "code": chunk.get("error_code"),
+                }
+            }
+
+        for key in ("id", "created", "model"):
+            if chunk.get(key) is not None:
+                result[key] = chunk[key]
+        if chunk.get("usage"):
+            usage = chunk["usage"]
+
+        for choice in chunk.get("choices") or []:
+            reason = choice.get("finish_reason")
+            if reason is not None:
+                last_finish_reason = _normalize_finish_reason(reason)
+            delta = choice.get("delta") or {}
+            if isinstance(delta.get("content"), str):
+                text_parts.append(delta["content"])
+            if isinstance(delta.get("reasoning_content"), str):
+                reasoning_parts.append(delta["reasoning_content"])
+            for call in delta.get("tool_calls") or []:
+                index = call.get("index", 0)
+                current = tool_calls.setdefault(index, {
+                    "id": call.get("id"),
+                    "type": call.get("type", "function"),
+                    "function": {"name": "", "arguments": ""},
+                })
+                if call.get("id"):
+                    current["id"] = call["id"]
+                if call.get("type"):
+                    current["type"] = call["type"]
+                function = call.get("function") or {}
+                if function.get("name"):
+                    current["function"]["name"] += function["name"]
+                if function.get("arguments"):
+                    current["function"]["arguments"] += function["arguments"]
+
+    message = result["choices"][0]["message"]
+    message["content"] = "".join(text_parts)
+    if reasoning_parts:
+        message["reasoning_content"] = "".join(reasoning_parts)
+    if tool_calls:
+        message["tool_calls"] = [tool_calls[index] for index in sorted(tool_calls)]
+    result["choices"][0]["finish_reason"] = last_finish_reason or ("tool_calls" if tool_calls else "stop")
+    if usage:
+        result["usage"] = usage
+    return result
+
+
+def _parse_upstream_json(upstream):
+    """兼容上游普通 JSON 和错误地返回 SSE 的情况。"""
+    raw = upstream.content
+    try:
+        result = json.loads(raw.decode("utf-8"))
+        if isinstance(result, dict) and result.get("choices"):
+            for choice in result["choices"]:
+                choice["finish_reason"] = _normalize_finish_reason(choice.get("finish_reason"))
+        return result
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return _parse_sse_bytes(raw)
+
+
 def _cors(resp: Response) -> Response:
     resp.headers["Access-Control-Allow-Origin"] = "*"
     resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
@@ -409,54 +514,72 @@ def chat_completions():
 
     if want_stream:
         def generate():
-            """转发 SSE，并把 CodeArts 的结束原因规范成 OpenAI 常见值。"""
-            saw_terminal = False
+            """严格转发为 OpenAI SSE，确保每个事件只有一个 JSON 文档。"""
+            content_type = (upstream.headers.get("Content-Type") or "").lower()
+            saw_done = False
+
+            # 上游偶尔会在请求 stream=true 时返回普通 JSON，包装成单个 SSE 帧。
+            if "text/event-stream" not in content_type:
+                result = _parse_upstream_json(upstream)
+                payload = json.dumps(
+                    result, ensure_ascii=False, separators=(",", ":")
+                ).encode("utf-8")
+                yield b"data: " + payload + b"\n\n"
+                yield b"data: [DONE]\n\n"
+                return
+
             for raw_line in upstream.iter_lines(decode_unicode=False):
                 if not raw_line:
-                    yield b"\n"
+                    # SSE 事件的空行由下面的 data 分支统一输出，避免多余分隔符。
                     continue
-                # 保留 SSE 注释/非 data 行
                 if not raw_line.startswith(b"data:"):
-                    yield raw_line + b"\n"
+                    # SSE 注释（例如心跳）原样保留，但统一使用标准换行。
+                    if raw_line.startswith(b":"):
+                        yield raw_line + b"\n\n"
                     continue
-                prefix, payload = raw_line[:5], raw_line[5:].lstrip()
+
+                payload = raw_line[5:].strip()
                 if payload == b"[DONE]":
-                    saw_terminal = True
-                    yield b"data: [DONE]\n\n"
+                    if not saw_done:
+                        yield b"data: [DONE]\n\n"
+                        saw_done = True
                     continue
                 try:
                     chunk = json.loads(payload.decode("utf-8"))
-                    choices = chunk.get("choices") or []
-                    for choice in choices:
-                        reason = choice.get("finish_reason")
-                        # CodeArts/部分模型可能返回 other 或空值；Cherry Studio
-                        # 只接受 stop、length、tool_calls、content_filter 等标准值。
-                        if reason == "other":
-                            choice["finish_reason"] = "stop"
-                            saw_terminal = True
-                    payload = json.dumps(chunk, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-                    yield b"data:" + payload + b"\n\n"
+                    for choice in chunk.get("choices") or []:
+                        if choice.get("finish_reason") in (None, "other"):
+                            # 只有已明确结束或上游发送空结束原因时才补 stop。
+                            if choice.get("finish_reason") == "other":
+                                choice["finish_reason"] = "stop"
+                    payload = json.dumps(
+                        chunk, ensure_ascii=False, separators=(",", ":")
+                    ).encode("utf-8")
+                    yield b"data: " + payload + b"\n\n"
                 except (UnicodeDecodeError, json.JSONDecodeError):
-                    # 非 JSON 数据原样传递，避免破坏错误事件
-                    yield raw_line + b"\n"
-            if not saw_terminal:
+                    # 丢弃无法解析的上游行，不能将它与下一个 JSON 拼接给客户端。
+                    continue
+
+            if not saw_done:
                 yield b"data: [DONE]\n\n"
 
         resp = Response(generate(), status=200, mimetype="text/event-stream")
-        resp.headers["Cache-Control"] = "no-cache"
+        resp.headers["Cache-Control"] = "no-cache, no-transform"
         resp.headers["Content-Type"] = "text/event-stream; charset=utf-8"
         resp.headers["X-Accel-Buffering"] = "no"
         return _cors(resp)
 
-    # 非流式：规范化结束原因并显式使用 UTF-8，避免客户端报 other
-    try:
-        result = upstream.json()
-        for choice in result.get("choices") or []:
-            if choice.get("finish_reason") == "other":
-                choice["finish_reason"] = "stop"
-        output = json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    except (ValueError, json.JSONDecodeError):
-        output = upstream.content
+    # 非流式：无论上游返回 JSON 还是 SSE，都统一聚合成单个 JSON。
+    # CodeArts 在排队、重试或特定模型场景下可能即使请求 stream=false
+    # 仍返回 text/event-stream；直接转发会导致客户端把 data: 当作 JSON 解析。
+    result = _parse_upstream_json(upstream)
+    if isinstance(result, dict) and result.get("error"):
+        resp = Response(
+            json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+            status=502,
+            content_type="application/json; charset=utf-8",
+        )
+        return _cors(resp)
+    output = json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     resp = Response(output, status=200, content_type="application/json; charset=utf-8")
     return _cors(resp)
 
