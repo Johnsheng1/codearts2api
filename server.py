@@ -48,6 +48,10 @@ MODEL_CACHE_PATH = os.path.join(
 SUPPORTED_MODELS = list(FALLBACK_MODELS)
 MODEL_DETAILS = {}
 
+# 代理监听地址；改端口只需改这里（或设环境变量），启动日志会同步变化
+LISTEN_HOST = os.getenv("CODEARTS_PROXY_HOST", "127.0.0.1")
+LISTEN_PORT = int(os.getenv("CODEARTS_PROXY_PORT", "8787"))
+
 app = Flask(__name__)
 
 
@@ -585,8 +589,11 @@ def chat_completions():
 
 
 if __name__ == "__main__":
-    print("CodeArts OpenAI 兼容代理已启动: http://127.0.0.1:8787")
-    print("OpenAI Base URL: http://127.0.0.1:8787/v1")
+    # 启动时先同步一次真实模型列表（失败则回退到缓存/兜底列表），再打印。
+    if not _refresh_models():
+        _load_model_cache()
+    print(f"CodeArts OpenAI 兼容代理已启动: http://{LISTEN_HOST}:{LISTEN_PORT}")
+    print(f"OpenAI Base URL: http://{LISTEN_HOST}:{LISTEN_PORT}/v1")
     print("可用模型:", SUPPORTED_MODELS)
     print("按 Ctrl+C 停止")
-    app.run(host="127.0.0.1", port=8787, threaded=True)
+    app.run(host=LISTEN_HOST, port=LISTEN_PORT, threaded=True)
