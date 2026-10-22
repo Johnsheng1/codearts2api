@@ -1,6 +1,10 @@
 # CodeArts OpenAI 兼容代理
 
-把华为云 CodeArts [https://codearts.huaweicloud.com/] 的模型接口（盘古开源大模型2.0、GLM-5.2）包装成**标准 OpenAI Chat Completions API**。
+把华为云 CodeArts [https://codearts.huaweicloud.com/] 的模型接口（盘古开源大模型2.0、GLM-5.2、GLM-5.3、deepseek-flash-v4,deepseek-flash-v4.1,deepseek-v4-pro,Qwen）包装成**标准 OpenAI Chat Completions API**。
+
+> [!IMPORTANT]
+> 具体可用模型以程序自动同步的最新模型为准！！！
+
 > [!TIP]
 > 本工具无视华为云模型请求的高峰期排队策略，可以直接插队获得模型调用
 
