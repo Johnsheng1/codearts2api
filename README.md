@@ -1,6 +1,8 @@
 # CodeArts OpenAI 兼容代理
 
 把华为云 CodeArts [https://codearts.huaweicloud.com/] 的模型接口（盘古开源大模型2.0、GLM-5.2）包装成**标准 OpenAI Chat Completions API**。
+> [!TIP]
+> 本工具无视华为云模型请求的排队策略，可以直接插队获得模型调用
 
 底层走华为云 `SDK-HMAC-SHA256` 请求签名，AK/SK 存放在 `.env`。
 ## 新增免费层级模型，可使用benefit.py一键签到并通过server.py调用
