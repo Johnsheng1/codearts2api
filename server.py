@@ -13,11 +13,13 @@ Chat Completions API，供 Claude Code / OpenCode / Cline / Cherry Studio
 默认监听:  http://127.0.0.1:8787
 OpenAI Base URL: http://127.0.0.1:8787/v1
 """
+import collections
 import datetime
 import hashlib
 import hmac
 import json
 import os
+import threading
 import time
 import urllib.parse
 
@@ -67,7 +69,107 @@ MODEL_DETAILS = {}
 LISTEN_HOST = os.getenv("CODEARTS_PROXY_HOST", "127.0.0.1")
 LISTEN_PORT = int(os.getenv("CODEARTS_PROXY_PORT", "8787"))
 
+# ------------------------------------------------------------------ 并发闸门
+# 实测结论（probe_concurrency.py，见 README「并发限制」一节）：
+#   1. 上游超限是「硬拒绝」，不是排队：HTTP 400 + {"error_code":"TM.00001041",
+#      "error_msg":"并发会话数已达上限(3个)..."}，该模型实测上限为 3 个并发会话；
+#      另有一类按分钟计数的限流：InferHub.ModelArts.81101.429（300 次/分钟）。
+#   2. 会话在请求结束后不会立刻归还额度，实测需再等约 45~60 秒才释放。
+#      因此「同时在途请求数」并不能反映上游真实占用，必须把冷却期也算进去。
+# 所以这里用「在途 + 冷却」的负载模型：请求结束后槽位继续占用 SESSION_COOLDOWN 秒。
+MAX_CONCURRENCY = int(os.getenv("CODEARTS_MAX_CONCURRENCY", "3"))
+# 排队等待上限；超过则返回 429 + Retry-After，交由客户端退避重试
+QUEUE_TIMEOUT = float(os.getenv("CODEARTS_QUEUE_TIMEOUT", "120"))
+# 会话冷却：模拟上游「会话额度延迟归还」。设 0 可退回纯在途限流（会重新出现
+# TM.00001041，但吞吐不受冷却影响）
+SESSION_COOLDOWN = float(os.getenv("CODEARTS_SESSION_COOLDOWN", "45"))
+
 app = Flask(__name__)
+
+
+class ConcurrencyGate:
+    """限制同时打向上游的请求数，避免触发上游的并发会话上限。
+
+    负载 = 在途请求数 + 冷却中的槽位数。冷却用于吸收上游「会话额度延迟归还」
+    的行为（实测约 45~60 秒），否则一波请求刚结束就发下一波必定被拒。
+
+    严格 FIFO 排队，保证不会有客户端被持续插队饿死。
+    """
+
+    def __init__(self, limit: int):
+        self._cond = threading.Condition()
+        self._limit = max(1, int(limit))
+        self._active = 0
+        self._waiters = collections.deque()
+        self._ticket = 0
+        self.peak = 0
+        self.timeouts = 0
+        self.rejected = 0
+
+    def acquire(self, timeout: float) -> bool:
+        """排队获取一个槽位，超时返回 False。"""
+        deadline = time.monotonic() + timeout
+        with self._cond:
+            self._ticket += 1
+            ticket = self._ticket
+            self._waiters.append(ticket)
+            granted = False
+            try:
+                while True:
+                    now = time.monotonic()
+                    if self._waiters[0] == ticket and self._active < self._limit:
+                        self._waiters.popleft()
+                        self._active += 1
+                        self.peak = max(self.peak, self._active)
+                        granted = True
+                        return True
+                    remaining = deadline - now
+                    if remaining <= 0:
+                        self.timeouts += 1
+                        return False
+                    self._cond.wait(min(remaining, 0.5))
+            finally:
+                if not granted and ticket in self._waiters:
+                    self._waiters.remove(ticket)
+                self._cond.notify_all()
+
+    def release(self, cooldown: float = 0.0) -> None:
+        """归还槽位；cooldown > 0 时延迟归还，模拟上游会话的延迟释放。"""
+        if cooldown and cooldown > 0:
+            timer = threading.Timer(cooldown, self._release_now)
+            timer.daemon = True
+            timer.start()
+        else:
+            self._release_now()
+
+    def _release_now(self) -> None:
+        with self._cond:
+            if self._active > 0:
+                self._active -= 1
+            self._cond.notify_all()
+
+    def stats(self) -> dict:
+        with self._cond:
+            return {
+                "limit": self._limit,
+                "active": self._active,
+                "waiting": len(self._waiters),
+                "peak": self.peak,
+                "queue_timeouts": self.timeouts,
+            }
+
+
+GATE = ConcurrencyGate(MAX_CONCURRENCY)
+
+
+def _rate_limited_response(message: str, retry_after: int):
+    """排队超时时返回标准 429，让客户端按 Retry-After 退避重试。"""
+    resp = jsonify(
+        {"error": {"message": message, "type": "rate_limit_error",
+                   "code": "concurrency_limit"}}
+    )
+    resp.headers["Retry-After"] = str(max(1, int(retry_after)))
+    return _cors(resp), 429
 
 
 def _signed_request(method: str, url: str, body: bytes = b"", extra_headers=None, timeout=30):
@@ -533,6 +635,16 @@ def get_model(model_id):
     return jsonify(_model_payload(model_id))
 
 
+@app.route("/healthz", methods=["GET"])
+def healthz():
+    """并发闸门的运行时状态，用于排查「请求为什么在排队」。"""
+    return jsonify({
+        "status": "ok",
+        "models": len(SUPPORTED_MODELS),
+        "concurrency": GATE.stats(),
+    })
+
+
 @app.route("/v1/chat/completions", methods=["POST", "OPTIONS"])
 def chat_completions():
     if request.method == "OPTIONS":
@@ -578,11 +690,22 @@ def chat_completions():
     body = json.dumps(req_json, ensure_ascii=False).encode("utf-8")
     headers = _hmac_headers(body, benefit=benefit, model_id=model)
 
+    # 并发闸门：上游超限是硬拒绝而非排队，必须由代理先削峰。
+    # 排不到槽位就返回 429 + Retry-After，让客户端退避重试，
+    # 而不是把注定被上游拒绝的请求发出去。
+    if not GATE.acquire(QUEUE_TIMEOUT):
+        return _rate_limited_response(
+            f"代理侧并发排队超时（上限 {MAX_CONCURRENCY}，已等待 {QUEUE_TIMEOUT:g}s）",
+            retry_after=SESSION_COOLDOWN or 5,
+        )
+
     try:
         upstream = requests.post(
             TARGET, data=body, headers=headers, stream=True, timeout=600
         )
     except Exception as e:
+        # 请求没建立起来，上游不会为此占用会话，直接归还槽位、不进入冷却
+        GATE.release()
         return _cors(jsonify({"error": {"message": f"upstream error: {e}"}})), 502
 
     if upstream.status_code != 200:
@@ -590,6 +713,8 @@ def chat_completions():
             detail = upstream.text[:2000]
         except Exception:
             detail = ""
+        # 上游直接拒绝（含并发会话已达上限），不会占用会话额度，立即归还槽位
+        GATE.release()
         return (
             _cors(
                 jsonify(
@@ -605,6 +730,14 @@ def chat_completions():
 
     if want_stream:
         def generate():
+            """确保槽位覆盖整个流式响应，结束后按 SESSION_COOLDOWN 进入冷却。"""
+            try:
+                for chunk in _stream_body():
+                    yield chunk
+            finally:
+                GATE.release(SESSION_COOLDOWN)
+
+        def _stream_body():
             """严格转发为 OpenAI SSE；仅对 benefit 流补齐缺失的结束原因。"""
             content_type = (upstream.headers.get("Content-Type") or "").lower()
             is_benefit = model not in AGENT_MODELS
@@ -690,7 +823,11 @@ def chat_completions():
     # 非流式：无论上游返回 JSON 还是 SSE，都统一聚合成单个 JSON。
     # CodeArts 在排队、重试或特定模型场景下可能即使请求 stream=false
     # 仍返回 text/event-stream；直接转发会导致客户端把 data: 当作 JSON 解析。
-    result = _parse_upstream_json(upstream)
+    try:
+        result = _parse_upstream_json(upstream)
+    finally:
+        # 上游已 200，会话已建立，必须进入冷却
+        GATE.release(SESSION_COOLDOWN)
     if isinstance(result, dict) and result.get("error"):
         resp = Response(
             json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
@@ -710,5 +847,9 @@ if __name__ == "__main__":
     print(f"CodeArts OpenAI 兼容代理已启动: http://{LISTEN_HOST}:{LISTEN_PORT}")
     print(f"OpenAI Base URL: http://{LISTEN_HOST}:{LISTEN_PORT}/v1")
     print("可用模型:", SUPPORTED_MODELS)
+    print(
+        f"并发闸门: 上限 {MAX_CONCURRENCY}，排队超时 {QUEUE_TIMEOUT:g}s，"
+        f"会话冷却 {SESSION_COOLDOWN:g}s（查看 /healthz）"
+    )
     print("按 Ctrl+C 停止")
     app.run(host=LISTEN_HOST, port=LISTEN_PORT, threaded=True)

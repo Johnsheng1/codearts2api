@@ -11,7 +11,7 @@
 底层走华为云 `SDK-HMAC-SHA256` 请求签名，AK/SK 存放在 `.env`。
 ## 新增免费层级模型，可使用benefit.py一键签到并通过server.py调用
 > [!TIP]
-> 建议使用opencode，pi，hermes，openclaw作为智能体接入。免费codearts具有5并发限制，其他代码智能体通常会超过这个限制，从而影响体验
+> 免费 codearts 存在并发会话上限，超限是**直接拒绝**而非排队。`server.py` 已内置并发闸门做削峰，因此不再依赖特定智能体的单线程行为——任何智能体接入都会被代理统一限流。详见下文「并发限制与代理侧削峰」。
 
 ## 使用方法
 
@@ -59,6 +59,46 @@ http://127.0.0.1:8787/v1
 
 支持的工具示例：OpenCode、Cline、Continue、LobeChat、Cherry Studio 等所有支持自定义 OpenAI 兼容端点的工具。
 
+## 并发限制与代理侧削峰
+
+上游对超限请求是**硬拒绝**而不是排队，所以必须由代理先削峰。以下结论均来自实测脚本
+`probe_concurrency.py`，不是按文档推测：
+
+| 现象 | 实测结果 |
+| --- | --- |
+| 超限表现 | `HTTP 400` + `{"error_code":"TM.00001041","error_msg":"并发会话数已达上限(3个)…"}`，也可能以 `HTTP 200` + SSE 内嵌 `error_code` 返回 |
+| 并发上限 | `deepseek-v4.1-flash` 实测 **3** 个并发会话（上限因模型/通道而异，故做成可配置） |
+| 另一类限流 | `InferHub.ModelArts.81101.429`：每分钟 300 次 |
+| 会话释放 | 请求结束后额度**不立即归还**，实测还需 45~60 秒 |
+
+最后一条是关键：只限制「同时在途请求数」并不够，一波请求刚结束就发下一波照样被拒。
+因此代理采用「**在途 + 冷却**」负载模型——请求结束后槽位继续占用一段时间。
+
+### 参数（环境变量）
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `CODEARTS_MAX_CONCURRENCY` | `3` | 槽位上限（含冷却中的槽位），即上游允许的并发会话数 |
+| `CODEARTS_QUEUE_TIMEOUT` | `120` | 排队等待上限，超时返回 `429` + `Retry-After` |
+| `CODEARTS_SESSION_COOLDOWN` | `45` | 请求结束后槽位继续占用的秒数，用于吸收上游的延迟释放；设为 `0` 退回纯在途限流 |
+
+### 行为对照
+
+| 场景 | 改动前 | 改动后 |
+| --- | --- | --- |
+| 6 个并发打同一模型 | 第 4 个起收到 `TM.00001041`，直接失败 | 3 个立即返回，3 个排队约 47s 后成功，上游零拒绝 |
+| 排队超过 `CODEARTS_QUEUE_TIMEOUT` | 无此机制 | 返回 `429` + `Retry-After: 45`，由客户端退避重试 |
+
+`GET /healthz` 返回实时闸门状态（`active` / `waiting` / `peak` / `queue_timeouts`），
+排查「请求为什么在排队」时直接看它。
+
+### 复现实验
+
+```cmd
+python probe_concurrency.py --models deepseek-v4.1-flash --n 3   # 直打上游，观察超限报错与会话残留
+python test_gate.py 6                                            # 经代理，验证排队后全部成功
+```
+
 ## 本地测试
 
 ```cmd
@@ -77,15 +117,18 @@ python test_openai.py
 ```text
 codearts2api/
 ├── .env               # AK/SK
-├── server.py          # 主服务：签名 + 转发
+├── server.py          # 主服务：签名 + 转发 + 并发闸门
+├── benefit.py         # 免费额度签到 / 余额 / 模型列表
 ├── requirements.txt   # Python 依赖
-├── test_openai.py     # 本地测试脚本
+├── probe_concurrency.py  # 上游并发上限探测（只读，不改服务）
+├── test_openai.py     # 基础连通性测试
+├── test_gate.py       # 代理并发闸门验证
 └── README.md
 ```
 
 ## 说明
 
-- 代理只做签名和转发，不修改模型行为。
+- 代理只做签名、转发和并发削峰，不修改模型行为。
 - 每次调用会消耗华为云 CodeArts 套餐额度（token）。
 - 仅绑定 `127.0.0.1`，不会对外网开放。
 > [!CAUTION]
