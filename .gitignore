@@ -1,0 +1,9 @@
+# 华为云 AK/SK，绝不入库
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+
+# 运行日志
+*.log
